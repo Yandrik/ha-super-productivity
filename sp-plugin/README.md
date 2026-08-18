@@ -77,6 +77,16 @@ A rules-based automation engine that connects Super Productivity to Home Assista
 - Iframe never handles raw credentials
 - Old configs with embedded tokens auto-migrate to secret storage
 
+## Live tracked-task sync
+
+Configure this plugin on each Super Productivity device with the same Home
+Assistant URL and webhook ID. Starting, stopping, or switching the tracked task
+on one device is applied to the others after the next two-second poll. The task
+must already be present on every device through Super Productivity's normal data
+sync. Focus Mode state is not synchronized.
+Auto-sync can be disabled in Settings. When a remote task is missing locally,
+the plugin triggers SP sync and retries three times at five-second intervals.
+
 ## Version History
 
 - **5.0** — Architecture rewrite: plugin.js owns secrets + API, iframe is pure UI (bridge pattern)

@@ -94,8 +94,27 @@ async def async_setup_webhook(
 
     async def handle_webhook(hass, webhook_id, request):
         """Handle incoming webhook from SP plugin."""
-        _LOGGER.debug("Webhook received - triggering immediate refresh")
-        await coordinator.async_request_refresh()
+        from aiohttp import web
+
+        try:
+            payload = await request.json()
+        except (ValueError, TypeError):
+            return web.json_response({"error": "Invalid JSON"}, status=400)
+
+        event = payload.get("event")
+        if (
+            event in ("task_started", "task_stopped")
+            and payload.get("taskSyncEnabled", True)
+        ):
+            state = coordinator.update_live_sync_state(payload)
+            await coordinator.async_request_refresh()
+        elif event == "sync_poll":
+            state = coordinator.live_sync_state
+        else:
+            state = coordinator.live_sync_state
+            await coordinator.async_request_refresh()
+
+        return web.json_response(state)
 
     async_register(
         hass,

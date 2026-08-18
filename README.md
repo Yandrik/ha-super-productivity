@@ -93,6 +93,20 @@ super_productivity_<entry_id>
 ```
 Find it in Settings > System > Logs, or via the API.
 
+### Live tracked-task sync
+
+Install and configure the SP plugin on each device with the same Home Assistant
+URL and webhook ID. The most recent start, stop, or task switch is then relayed
+through Home Assistant and applied to the other SP clients (within about two
+seconds). Task IDs must already exist on every device through normal SP data
+sync. This synchronizes only the actively tracked task; Focus Mode and its timer
+state are intentionally not mirrored.
+
+Tracked-task auto-sync can be disabled in the plugin's Settings tab. If a
+remote task has not arrived through normal SP data sync yet, the plugin triggers
+an SP sync and retries the switch three times at five-second intervals before
+giving up.
+
 ---
 
 ## Super Productivity Plugin

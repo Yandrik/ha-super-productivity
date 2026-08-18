@@ -128,6 +128,7 @@
 <div class="field"><label>Home Assistant URL</label><input id="cfg-url" placeholder="http://homeassistant.local:8123"><div class="hint">Local URL only</div></div>
 <div class="field"><label>Access Token</label><input id="cfg-token" type="password" placeholder="eyJ..."></div>
 <div class="field"><label>Webhook ID</label><input id="cfg-webhook" placeholder="super_productivity_01KX..."></div>
+<div class="field"><label>Tracked-task auto-sync</label><select id="cfg-auto-task-sync"><option value="true">Enabled</option><option value="false">Disabled</option></select><div class="hint">Mirror the active tracked task between SP devices through HA</div></div>
 </div>
 <div class="card"><div class="card-title">Display Sensors</div>
 <div class="field"><select id="cfg-sensor-picker" onchange="addSensorFromPicker()"><option value="">-- Pick a sensor to add --</option></select></div>
@@ -138,7 +139,7 @@
 </div>
 
 <script>
-let config={haUrl:'',webhookId:'',rules:[],showSensors:''};
+let config={haUrl:'',webhookId:'',rules:[],showSensors:'',autoTaskSync:true};
 let haToken=''; // Stored separately via secret API
 let editingRuleIdx=-1, projects=[], tags=[], svcHist=[];
 let haEntities={scenes:[],lights:[],switches:[],scripts:[],automations:[],sensors:[],media_players:[],all:[]};
@@ -177,6 +178,7 @@ async function loadConfig(){
   config.webhookId = cfg.webhookId || '';
   config.rules = cfg.rules || [];
   config.showSensors = cfg.showSensors || '';
+  config.autoTaskSync = cfg.autoTaskSync !== false;
   haToken = b.getTokenMasked(); // only get masked version for display
   console.log('[HA UI] Config from bridge:', config.rules.length, 'rules, URL:', config.haUrl ? 'set' : 'empty');
   populateSettings();
@@ -190,6 +192,7 @@ async function saveConfig(){
     haUrl: config.haUrl,
     webhookId: config.webhookId,
     showSensors: config.showSensors,
+    autoTaskSync: config.autoTaskSync,
     token: tokenInput || undefined, // only send if user entered/changed it
   });
   // Save rules separately
@@ -202,11 +205,13 @@ document.getElementById('cfg-url').value=config.haUrl||'';
 document.getElementById('cfg-token').value=''; // never pre-fill token for security
 document.getElementById('cfg-token').placeholder=haToken?'Token saved (enter new to change)':'Enter token...';
 document.getElementById('cfg-webhook').value=config.webhookId||'';
+document.getElementById('cfg-auto-task-sync').value=config.autoTaskSync===false?'false':'true';
 renderSensorList();
 }
 async function saveSettings(){
 config.haUrl=document.getElementById('cfg-url').value.trim().replace(/\/$/,'');
 config.webhookId=document.getElementById('cfg-webhook').value.trim();
+config.autoTaskSync=document.getElementById('cfg-auto-task-sync').value==='true';
 await saveConfig();
 PluginAPI.showSnack({msg:'Settings saved!',type:'SUCCESS'});
 await fetchHAEntities();

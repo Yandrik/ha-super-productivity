@@ -13,8 +13,9 @@
 // CONFIG & SECRETS
 // ============================================================
 
-let config = { haUrl: '', webhookId: '', rules: [], showSensors: '' };
+let config = { haUrl: '', webhookId: '', rules: [], showSensors: '', autoTaskSync: true };
 let haToken = '';
+let deviceId = '';
 let configReady = false;
 
 async function loadConfig() {
@@ -37,12 +38,25 @@ async function loadConfig() {
     }
   } catch (e) { console.log('[HA Bridge] Config load error:', e); }
   if (!config.rules) config.rules = [];
+  if (typeof config.autoTaskSync !== 'boolean') config.autoTaskSync = true;
 
   // Load token from secret storage (local-only, never synced)
   try {
     const secret = await PluginAPI.getSecret('haToken');
     if (secret) haToken = secret;
   } catch (e) { console.log('[HA Bridge] getSecret error:', e); }
+
+  // A device identifier must remain local. If it were stored in synced plugin
+  // data, two SP installations would identify as the same sync participant.
+  try {
+    deviceId = await PluginAPI.getSecret('deviceId') || '';
+    if (!deviceId) {
+      deviceId = typeof crypto !== 'undefined' && crypto.randomUUID
+        ? crypto.randomUUID()
+        : `sp-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+      await PluginAPI.setSecret('deviceId', deviceId);
+    }
+  } catch (e) { console.log('[HA Bridge] device id error:', e); }
 
   configReady = true;
   console.log('[HA Bridge] Config ready:', config.rules.length, 'rules, haUrl:', config.haUrl ? 'set' : 'empty', 'token:', haToken ? 'set' : 'empty');
@@ -101,7 +115,130 @@ async function executeAction(action, context = {}) {
 
 async function notifyWebhook(event, data = {}) {
   if (!config.webhookId || !config.haUrl) return;
-  try { await fetch(`${config.haUrl.replace(/\/$/, '')}/api/webhook/${config.webhookId}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ event, ...data, timestamp: Date.now() }) }); } catch (e) {}
+  try {
+    const response = await fetch(`${config.haUrl.replace(/\/$/, '')}/api/webhook/${config.webhookId}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        event,
+        ...data,
+        deviceId,
+        taskSyncEnabled: config.autoTaskSync !== false,
+        timestamp: Date.now(),
+      }),
+    });
+    return response.ok ? await response.json() : null;
+  } catch (e) { return null; }
+}
+
+// ============================================================
+// LIVE TRACKED-TASK SYNC
+// ============================================================
+
+const TASK_SYNC_POLL_MS = 2000;
+const TASK_SYNC_RETRY_MS = 5000;
+const TASK_SYNC_MAX_RETRIES = 3;
+let taskSyncInterval = null;
+let lastSyncVersion = 0;
+let pendingRemoteTaskId;
+let taskSyncPolling = false;
+let pendingTaskRetry = null;
+
+function cancelPendingTaskRetry() {
+  if (pendingTaskRetry?.timeout) clearTimeout(pendingTaskRetry.timeout);
+  pendingTaskRetry = null;
+}
+
+function applyRemoteTask(taskId, version) {
+  cancelPendingTaskRetry();
+  pendingRemoteTaskId = taskId;
+  PluginAPI.dispatchAction({ type: '[Task] SetCurrentTask', id: taskId });
+  lastSyncVersion = Math.max(lastSyncVersion, version);
+}
+
+function scheduleRemoteTaskRetry(state, attempt) {
+  cancelPendingTaskRetry();
+  pendingTaskRetry = {
+    version: state.version,
+    taskId: state.taskId,
+    attempt,
+    timeout: setTimeout(async () => {
+      const retry = pendingTaskRetry;
+      if (!retry || retry.version !== state.version || !config.autoTaskSync) return;
+      try {
+        const tasks = await PluginAPI.getTasks();
+        if (tasks.some(task => task.id === state.taskId)) {
+          applyRemoteTask(state.taskId, state.version);
+          return;
+        }
+        if (attempt < TASK_SYNC_MAX_RETRIES) {
+          console.log(`[HA Bridge] Task ${state.taskId} still missing; retry ${attempt + 1}/${TASK_SYNC_MAX_RETRIES} in 5s`);
+          scheduleRemoteTaskRetry(state, attempt + 1);
+        } else {
+          console.log(`[HA Bridge] Giving up remote task switch after ${TASK_SYNC_MAX_RETRIES} retries:`, state.taskId);
+          cancelPendingTaskRetry();
+        }
+      } catch (e) {
+        console.log('[HA Bridge] Remote task retry error:', e);
+        if (attempt < TASK_SYNC_MAX_RETRIES) scheduleRemoteTaskRetry(state, attempt + 1);
+        else cancelPendingTaskRetry();
+      }
+    }, TASK_SYNC_RETRY_MS),
+  };
+}
+
+async function recoverMissingRemoteTask(state) {
+  lastSyncVersion = state.version;
+  cancelPendingTaskRetry();
+  console.log('[HA Bridge] Remote task missing locally; triggering SP sync:', state.taskId);
+  try {
+    if (typeof PluginAPI.triggerSync === 'function') await PluginAPI.triggerSync();
+    else console.log('[HA Bridge] This SP version does not expose PluginAPI.triggerSync()');
+  } catch (e) {
+    console.log('[HA Bridge] SP sync failed; continuing with scheduled retries:', e);
+  }
+  scheduleRemoteTaskRetry(state, 1);
+}
+
+async function pollTrackedTaskState() {
+  if (taskSyncPolling || !config.autoTaskSync || !configReady || !config.webhookId || !config.haUrl || !deviceId) return;
+  taskSyncPolling = true;
+  try {
+    const state = await notifyWebhook('sync_poll', { lastVersion: lastSyncVersion });
+    if (!state || typeof state.version !== 'number' || state.version <= lastSyncVersion) return;
+    if (pendingTaskRetry && state.version > pendingTaskRetry.version) cancelPendingTaskRetry();
+    if (state.sourceDeviceId === deviceId || state.taskId === trackingTaskId) {
+      lastSyncVersion = state.version;
+      return;
+    }
+
+    const desiredTaskId = state.taskId || null;
+    if (desiredTaskId) {
+      const tasks = await PluginAPI.getTasks();
+      if (!tasks.some(task => task.id === desiredTaskId)) {
+        await recoverMissingRemoteTask(state);
+        return;
+      }
+    }
+
+    // currentTaskChange will fire after dispatch. Mark this exact transition so
+    // it is not published back to HA and echoed indefinitely between devices.
+    applyRemoteTask(desiredTaskId, state.version);
+  } catch (e) {
+    pendingRemoteTaskId = undefined;
+    console.log('[HA Bridge] Tracked-task sync error:', e);
+  } finally {
+    taskSyncPolling = false;
+  }
+}
+
+function startTrackedTaskSync() {
+  if (taskSyncInterval) clearInterval(taskSyncInterval);
+  taskSyncInterval = null;
+  cancelPendingTaskRetry();
+  if (!config.autoTaskSync) return;
+  taskSyncInterval = setInterval(() => { pollTrackedTaskState(); }, TASK_SYNC_POLL_MS);
+  pollTrackedTaskState();
 }
 
 // ============================================================
@@ -120,7 +257,9 @@ const haBridge = {
     config.haUrl = (settings.haUrl || '').replace(/\/$/, '');
     config.webhookId = settings.webhookId || '';
     config.showSensors = settings.showSensors || '';
+    config.autoTaskSync = settings.autoTaskSync !== false;
     await saveConfig();
+    startTrackedTaskSync();
     if (settings.token) await saveToken(settings.token);
     return true;
   },
@@ -262,11 +401,17 @@ PluginAPI.registerHook('finishDay', (data) => { setTimeout(() => onFinishDay(dat
 PluginAPI.registerHook('anyTaskUpdate', (data) => { setTimeout(() => notifyWebhook('task_activity', { action: data?.action, taskId: data?.taskId }), 10); });
 PluginAPI.registerHook('projectListUpdate', (data) => { setTimeout(() => evaluateRules('project_list_changed', { action: data?.action, projectId: data?.projectId }), 10); });
 PluginAPI.registerHook('workContextChange', (data) => { setTimeout(() => evaluateRules('context_switch', { contextId: data?.id, contextType: data?.type, contextTitle: data?.title }), 10); });
-PluginAPI.registerHook('persistedDataChanged', () => { setTimeout(() => loadConfig(), 100); });
+PluginAPI.registerHook('persistedDataChanged', () => {
+  setTimeout(() => { loadConfig().then(() => startTrackedTaskSync()); }, 100);
+});
 
 async function onCurrentTaskChange(data) {
   const currentTask = data?.current || null;
   const previousTask = data?.previous || null;
+  const newTaskId = currentTask?.id || null;
+  const isRemoteTransition = pendingRemoteTaskId !== undefined && pendingRemoteTaskId === newTaskId;
+  if (isRemoteTransition) pendingRemoteTaskId = undefined;
+  else cancelPendingTaskRetry();
   console.log('[HA Bridge] currentTaskChange:', currentTask?.id || 'null', '<-', previousTask?.id || 'null');
 
   if (currentTask) {
@@ -277,12 +422,18 @@ async function onCurrentTaskChange(data) {
     if (sessionTasksStarted === 1) await evaluateRules('first_task_of_day', ctx);
     if (previousTask) await evaluateRules('task_switch', ctx);
     startTimerChecks();
-    await notifyWebhook('task_started', { taskId: currentTask.id, title: currentTask.title });
+    if (!isRemoteTransition) {
+      const state = await notifyWebhook('task_started', { taskId: currentTask.id, title: currentTask.title });
+      if (state?.version) lastSyncVersion = Math.max(lastSyncVersion, state.version);
+    }
   } else {
     const ctx = previousTask ? buildContext(previousTask) : {};
     stopTimerChecks();
     await evaluateRules('task_stop', ctx);
-    await notifyWebhook('task_stopped', { taskId: previousTask?.id });
+    if (!isRemoteTransition) {
+      const state = await notifyWebhook('task_stopped', { taskId: previousTask?.id });
+      if (state?.version) lastSyncVersion = Math.max(lastSyncVersion, state.version);
+    }
   }
 }
 
@@ -336,5 +487,13 @@ async function onFinishDay(data) {
 // ============================================================
 
 loadConfig().then(() => {
-  console.log(`[HA Bridge v5.0] Ready. ${config.rules.length} rules. Token: ${haToken ? 'set' : 'not set'}.`);
+  console.log(`[HA Bridge v5.2] Ready. ${config.rules.length} rules. Token: ${haToken ? 'set' : 'not set'}.`);
+  startTrackedTaskSync();
 });
+
+if (PluginAPI.onUnload) {
+  PluginAPI.onUnload(() => {
+    if (taskSyncInterval) clearInterval(taskSyncInterval);
+    cancelPendingTaskRetry();
+  });
+}

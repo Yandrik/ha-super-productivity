@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from datetime import timedelta
 import logging
+import time
 from typing import Any, TypeAlias
 
 from homeassistant.config_entries import ConfigEntry
@@ -117,6 +118,39 @@ class SuperProductivityCoordinator(DataUpdateCoordinator[SuperProductivityData])
         self._previous_task_id: str | None = None
         self._previous_done_ids: set[str] = set()
         self._previous_pending_count: int | None = None
+        self._live_sync_version = 0
+        self._live_sync_state: dict[str, Any] | None = None
+
+    def update_live_sync_state(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Store a tracked-task transition and return the canonical state."""
+        event = payload.get("event")
+        if event not in ("task_started", "task_stopped"):
+            return self.live_sync_state
+
+        self._live_sync_version += 1
+        self._live_sync_state = {
+            "version": self._live_sync_version,
+            "taskId": payload.get("taskId") if event == "task_started" else None,
+            "title": payload.get("title") if event == "task_started" else None,
+            "sourceDeviceId": payload.get("deviceId"),
+            "timestamp": payload.get("timestamp") or int(time.time() * 1000),
+        }
+        return self._live_sync_state
+
+    @property
+    def live_sync_state(self) -> dict[str, Any]:
+        """Return tracked-task state, seeding it from the REST API if needed."""
+        if self._live_sync_state is None:
+            task = self.data.current_task if self.data else None
+            self._live_sync_version += 1
+            self._live_sync_state = {
+                "version": self._live_sync_version,
+                "taskId": task.get("id") if task else None,
+                "title": task.get("title") if task else None,
+                "sourceDeviceId": "home-assistant",
+                "timestamp": int(time.time() * 1000),
+            }
+        return self._live_sync_state
 
     async def _async_update_data(self) -> SuperProductivityData:
         """Fetch data from the Super Productivity API."""
